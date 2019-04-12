@@ -7,9 +7,9 @@ import logging
 import re
 logging.basicConfig(level=logging.INFO)
 
-
-
-
+# Codigo para optener los diferentes PCollection de:
+# nombre, sistema, genero, fecha de nacimiento, email, telefono
+# rfc, calle, estado, municipio, cp
 class GetRegisters(beam.DoFn):
     def process(self, element):
         register = element.split(',')
@@ -26,6 +26,7 @@ class GetRegisters(beam.DoFn):
         yield pvalue.TaggedOutput('cp', [register[0], register[11]])
 
 
+# Codigo para limpieza de nombre
 class LimpiarNombre(beam.PTransform):
     def expand(self, pcoll):
         return (pcoll
@@ -34,6 +35,21 @@ class LimpiarNombre(beam.PTransform):
                 | 'Conservar LN' >> beam.ParDo(ConservarLetras())
                 | 'Mayus' >> beam.ParDo(Mayus())
                 | 'Separar' >> beam.ParDo(Separar_nombres()))
+
+
+class Arreglizar(beam.DoFn):
+    def process(self, element, table_name):
+        res = []
+        if table_name == 'cat_nombres':
+            res.append(element['token'])
+            res.append(element['data'])
+            res.append(element['replace'])
+            res.append(element['gen'])
+        if table_name == 'cat_token_nombres':
+            res.append(element['token_in'])
+            res.append(element['token_out'])
+            res.append(element['flag'])
+        yield res
 
 
 class ObtenerCatalogoNombres(beam.PTransform):
@@ -61,7 +77,8 @@ class ValidarNombre(beam.PTransform):
                                             pvalue.AsList(cat_nombres))
                       | 'Tokenizar' >> beam.ParDo(TokenizarValidar(),
                                             pvalue.AsList(cat_token_nombres))
-                      | 'Escribir conjunto' >> beam.io.WriteToText(output_val))
+                      # | 'Escribir conjunto' >> beam.io.WriteToText(output_val)
+                      )
 
 
 class ConservarLetras(beam.DoFn):
@@ -96,19 +113,7 @@ class Encoder(beam.DoFn):
         yield res
 
 
-class Arreglizar(beam.DoFn):
-    def process(self, element, table_name):
-        res = []
-        if table_name == 'cat_nombres':
-            res.append(element['token'])
-            res.append(element['data'])
-            res.append(element['replace'])
-            res.append(element['gen'])
-        if table_name == 'cat_token_nombres':
-            res.append(element['token_in'])
-            res.append(element['token_out'])
-            res.append(element['flag'])
-        yield res
+
 
 
 class RemplazarNombre(beam.DoFn):
@@ -147,6 +152,56 @@ class TokenizarValidar(beam.DoFn):
         yield [element[0], nombre.strip(), token, flag]
 
 
+class UnirNombreGenero(beam.DoFn):
+    def process(self, element, nombres):
+        for y in nombres:
+            if element[0] == y[0]:
+                yield [element[0], element[1], y[1]]
+                break
+
+class ObtenerGenero(beam.DoFn):
+    def process(self, element, cat_nombres):
+        genero = []
+        gen = None
+        if element[1] != '':
+            yield [element[0], element[1], element[2]]
+        else:
+            nombre = element[2].split(' ')
+            for x in nombre:
+                for y in cat_nombres:
+                    if x == y[1]:
+                        genero.append(y[3])
+                        break
+            if len(genero) > 0:
+                gen = genero[0]
+            else:
+                gen = None
+            for x in genero:
+                if gen != x and x is not None:
+                    gen = None
+            yield [element[0], gen, element[2]]
+
+
+class LimpiarFechas(beam.DoFn):
+    def process(self, element, formato_deseado):
+        fecha = ''
+        for format in ['%d/%m/%Y', '%d %b %Y', '%a %d %b %Y',
+                       '%A %d %b %Y', '%m/%d/%Y', '%Y%m%d',
+                       '%Y%d%m', '%d-%m-%Y', '%Y-%m-%d',
+                       '%d/%m/%y', '%d %b %y', '%a %d %b %y',
+                        '%A %d %b %y', '%m/%d/%y', '%y%m%d',
+                        '%y%d%m', '%d-%m-%y', '%y-%m-%d']:
+            try:
+                date = datetime.datetime.strptime(element[1], format) # turn the string into a unix timestamp
+                fecha = datetime.datetime.strftime(date, formato_deseado)
+                if date < datetime.datetime.now():
+                    break
+            except ValueError as e:
+                fecha = None
+                pass
+        yield [element[0], fecha]
+
+
 project_id = 'dataflow-5101052'
 date = datetime.datetime.now().strftime("%Y%m%d")
 time = datetime.datetime.now().strftime("%H%M%S")
@@ -156,7 +211,7 @@ bucket = 'air-test'
 input_val = 'gs://'+bucket+'/archivos_diarios/beam.csv'
 output_val = 'gs://'+bucket+'/archivos_diarios/res_beam.txt'
 output_val2 = 'gs://'+bucket+'/archivos_diarios/res_cat.txt'
-output_val3 = 'gs://'+bucket+'/archivos_diarios/combine.txt'
+output_val3 = 'gs://'+bucket+'/archivos_diarios/gen.txt'
 query_cat_nombres = 'SELECT * FROM `dataflow-5101052.DM.cat_nombres`'
 
 p = beam.Pipeline(runner="DataflowRunner", argv=[
@@ -179,11 +234,22 @@ registers = (p  | 'Read Alpha Data ' >> beam.io.ReadFromText(input_val, skip_hea
                                                          'telefono',
                                                          'rfc',
                                                          'calle',
-                                                         'esatdo',
+                                                         'estado',
                                                          'municipio',
                                                          'cp',
                                                          main='nombres'))
 
-registers.nombres | 'Validar nombre' >> ValidarNombre()
+nombres = registers["nombres"] | 'Validar nombre' >> ValidarNombre()
+
+generos = (registers["genero"] | 'Unir Nombre Genero' >> beam.ParDo(UnirNombreGenero(),
+                                                                            pvalue.AsList(nombres))
+                                     | 'Obtener Genero' >> beam.ParDo(ObtenerGenero(),
+                                                                        pvalue.AsList(cat_nombres)))
+
+fechas_nacimiento = registers["fechaNac"] | 'Limpiar Fechas de nacimento' >> beam.ParDo(LimpiarFechas(),'%d-%m-%Y')
+
+fechas_nacimiento |"Escribir registros" >> beam.io.WriteToText(output_val3)
+
+# nombresgenero |"Escribir registros" >> beam.io.WriteToText(output_val3)
 
 p.run()
